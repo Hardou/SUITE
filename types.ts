@@ -20,6 +20,19 @@ export interface GeneratedMedia {
   prompt: string;
 }
 
+export interface User {
+  email: string;
+  full_name?: string;
+  id?: number;
+}
+
+export interface AuthState {
+  user: User | null;
+  token: string | null;
+  isAuthenticated: boolean;
+  isLoading: boolean;
+}
+
 // Window augmentation for Veo API key selection
 declare global {
   interface AIStudio {

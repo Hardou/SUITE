@@ -1,6 +1,7 @@
 import React from 'react';
 import { View } from '../App';
-import { LayoutDashboard, Wand2, Menu, X } from 'lucide-react';
+import { LayoutDashboard, Wand2, Menu, X, LogOut, User } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -10,6 +11,7 @@ interface LayoutProps {
 
 export const Layout: React.FC<LayoutProps> = ({ children, currentView, onViewChange }) => {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = React.useState(false);
+  const { user, logout } = useAuth();
 
   const NavItem = ({ view, icon: Icon, label }: { view: View; icon: any; label: string }) => (
     <button
@@ -43,10 +45,11 @@ export const Layout: React.FC<LayoutProps> = ({ children, currentView, onViewCha
       {/* Sidebar */}
       <aside
         className={`${
-          isMobileMenuOpen ? 'block' : 'hidden'
-        } md:block w-full md:w-64 bg-slate-900 border-r border-slate-800 flex-shrink-0 fixed md:sticky top-0 md:h-screen z-40 overflow-y-auto`}
+          isMobileMenuOpen ? 'flex' : 'hidden'
+        } md:flex flex-col w-full md:w-64 bg-slate-900 border-r border-slate-800 flex-shrink-0 fixed md:sticky top-0 md:h-screen z-40`}
       >
-        <div className="p-6">
+        {/* Navigation Content */}
+        <div className="p-6 flex-1 overflow-y-auto">
           <h1 className="hidden md:block text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-8">
             BlankDigi Suite
           </h1>
@@ -73,6 +76,26 @@ export const Layout: React.FC<LayoutProps> = ({ children, currentView, onViewCha
               Veo Video Ready
             </div>
           </div>
+        </div>
+
+        {/* User Profile & Logout Section */}
+        <div className="p-4 border-t border-slate-800 bg-slate-900/80 mt-auto">
+            <div className="flex items-center gap-3 mb-3 px-2">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center shrink-0">
+                    <User className="w-4 h-4 text-white" />
+                </div>
+                <div className="overflow-hidden">
+                    <p className="text-sm font-medium text-white truncate">{user?.full_name || 'User'}</p>
+                    <p className="text-xs text-slate-500 truncate">{user?.email}</p>
+                </div>
+            </div>
+            <button
+                onClick={logout}
+                className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-red-500/10 hover:text-red-400 text-slate-400 py-2 rounded-lg transition-colors text-sm font-medium border border-slate-700 hover:border-red-500/30"
+            >
+                <LogOut className="w-4 h-4" />
+                Sign Out
+            </button>
         </div>
       </aside>
 
