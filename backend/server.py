@@ -435,7 +435,7 @@ async def verify_email(token: str):
 
 
 @app.get("/users/me", response_model=UserOut)
-async def read_users_me(current_user: dict = Depends(get_ai_user)):
+async def read_users_me(current_user: dict = Depends(get_current_user)):
     return {
         "id": current_user["id"],
         "email": current_user["email"],
