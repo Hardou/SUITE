@@ -485,6 +485,136 @@ async def reset_password(data: PasswordResetConfirm):
 
 
 # ----------------------------
+# Server-side AI proxy
+# ----------------------------
+@app.post("/ai/text")
+def ai_text(data: AiTextRequest, current_user: dict = Depends(get_current_user)):
+    client = _gemini_client()
+    config_kwargs = {}
+
+    if data.system_instruction:
+        config_kwargs["system_instruction"] = data.system_instruction
+    if data.use_thinking:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=32768)
+    if data.use_search:
+        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+
+    model = GEMINI_THINKING_MODEL if data.use_thinking else GEMINI_TEXT_MODEL
+    response = client.models.generate_content(
+        model=model,
+        contents=data.prompt,
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
+
+    grounding_urls = []
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        metadata = getattr(candidates[0], "grounding_metadata", None)
+        chunks = getattr(metadata, "grounding_chunks", None) or []
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            uri = getattr(web, "uri", None) if web else None
+            title = getattr(web, "title", None) if web else None
+            if uri and not any(item["uri"] == uri for item in grounding_urls):
+                grounding_urls.append({"uri": uri, "title": title or uri})
+
+    return {"text": getattr(response, "text", "") or "", "groundingUrls": grounding_urls}
+
+
+@app.post("/ai/image")
+def ai_image(data: AiImageRequest, current_user: dict = Depends(get_current_user)):
+    if data.aspect_ratio not in ("1:1", "3:4", "4:3", "9:16", "16:9"):
+        raise HTTPException(status_code=400, detail="Unsupported aspect ratio")
+
+    client = _gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_IMAGE_MODEL,
+        contents=data.prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            image_config=types.ImageConfig(aspect_ratio=data.aspect_ratio, image_size="1K"),
+        ),
+    )
+
+    for part in getattr(response, "parts", None) or []:
+        data_url = _part_to_data_url(part)
+        if data_url:
+            return {"data_url": data_url}
+    raise HTTPException(status_code=502, detail="AI image generation returned no image")
+
+
+@app.post("/ai/edit-image")
+def ai_edit_image(data: AiEditImageRequest, current_user: dict = Depends(get_current_user)):
+    image_bytes, mime_type = _decode_data_url(data.base64_image)
+    client = _gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_IMAGE_EDIT_MODEL,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            data.prompt,
+        ],
+        config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+    )
+
+    for part in getattr(response, "parts", None) or []:
+        data_url = _part_to_data_url(part)
+        if data_url:
+            return {"data_url": data_url}
+    raise HTTPException(status_code=502, detail="AI image editing returned no image")
+
+
+@app.post("/ai/video")
+def ai_video(data: AiVideoRequest, current_user: dict = Depends(get_current_user)):
+    if data.aspect_ratio not in ("16:9", "9:16"):
+        raise HTTPException(status_code=400, detail="Unsupported video aspect ratio")
+
+    image_bytes, mime_type = _decode_data_url(data.base64_image)
+    client = _gemini_client()
+    source = types.GenerateVideosSource(
+        prompt=data.prompt or "Animate this image",
+        image=types.Image(image_bytes=image_bytes, mime_type=mime_type),
+    )
+    operation = client.models.generate_videos(
+        model=GEMINI_VIDEO_MODEL,
+        source=source,
+        config=types.GenerateVideosConfig(
+            number_of_videos=1,
+            resolution="720p",
+            aspect_ratio=data.aspect_ratio,
+        ),
+    )
+
+    deadline = time.time() + 300
+    while not operation.done:
+        if time.time() >= deadline:
+            raise HTTPException(status_code=504, detail="Video generation timed out")
+        time.sleep(10)
+        operation = client.operations.get(operation)
+
+    generated = getattr(getattr(operation, "response", None), "generated_videos", None) or []
+    if not generated or not getattr(generated[0], "video", None):
+        raise HTTPException(status_code=502, detail="AI video generation returned no video")
+
+    fd, output_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    try:
+        client.files.download(file=generated[0].video, destination=output_path)
+    except Exception:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        raise
+
+    return FileResponse(
+        output_path,
+        media_type="video/mp4",
+        filename="generated.mp4",
+        background=BackgroundTask(lambda: os.path.exists(output_path) and os.unlink(output_path)),
+    )
+
+
+# ----------------------------
 # OAuth (optional)
 # ----------------------------
 @app.get("/login/google")
