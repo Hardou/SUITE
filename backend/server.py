@@ -6,7 +6,8 @@
 # - OAuth routes اختيارية (كتخدم إلا عبّيتي GOOGLE/GITHUB env)
 
 from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, FileResponse
+from starlette.background import BackgroundTask
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -20,6 +21,12 @@ import uuid
 import os
 import time
 import httpx
+import base64
+import re
+import tempfile
+
+from google import genai
+from google.genai import types
 
 
 # ----------------------------
@@ -49,9 +56,28 @@ def _env_bool(*names: str, default: bool = False) -> bool:
 # ----------------------------
 # Configuration (ENV only)
 # ----------------------------
-SECRET_KEY = _env("JWT_SECRET_KEY", "SECRET_KEY", default="CHANGE_ME")
+APP_ENV = _env("APP_ENV", "ENVIRONMENT", default="production").strip().lower()
+SECRET_KEY = _env("JWT_SECRET_KEY", "SECRET_KEY", default="")
+if not SECRET_KEY:
+    if APP_ENV in ("development", "dev", "local"):
+        SECRET_KEY = os.urandom(32).hex()
+    else:
+        raise RuntimeError("JWT_SECRET_KEY (or SECRET_KEY) is required outside local development")
+if len(SECRET_KEY) < 32:
+    raise RuntimeError("JWT secret must be at least 32 characters")
+
 ALGORITHM = _env("JWT_ALGORITHM", "ALGORITHM", default="HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = _env_int("ACCESS_TOKEN_EXPIRE_MINUTES", default=60)
+
+# Gemini / Veo: server-side only. Never expose GEMINI_API_KEY to the frontend bundle.
+GEMINI_API_KEY = _env("GEMINI_API_KEY", default="")
+GEMINI_TEXT_MODEL = _env("GEMINI_TEXT_MODEL", default="gemini-3-flash-preview")
+GEMINI_THINKING_MODEL = _env("GEMINI_THINKING_MODEL", default="gemini-3-pro-preview")
+GEMINI_IMAGE_MODEL = _env("GEMINI_IMAGE_MODEL", default="gemini-3-pro-image-preview")
+GEMINI_IMAGE_EDIT_MODEL = _env("GEMINI_IMAGE_EDIT_MODEL", default="gemini-2.5-flash-image")
+GEMINI_VIDEO_MODEL = _env("GEMINI_VIDEO_MODEL", default="veo-3.1-fast-generate-preview")
+AI_ALLOWED_EMAILS_RAW = _env("AI_ALLOWED_EMAILS", default="")
+AI_ALLOWED_EMAILS = {email.strip().lower() for email in AI_ALLOWED_EMAILS_RAW.split(",") if email.strip()}
 
 # OAuth (optional)
 GOOGLE_CLIENT_ID = _env("GOOGLE_CLIENT_ID", default="")
@@ -128,6 +154,29 @@ class PasswordResetRequest(BaseModel):
 class PasswordResetConfirm(BaseModel):
     token: str
     new_password: str
+
+
+class AiTextRequest(BaseModel):
+    prompt: str
+    use_thinking: bool = False
+    use_search: bool = False
+    system_instruction: Optional[str] = None
+
+
+class AiImageRequest(BaseModel):
+    prompt: str
+    aspect_ratio: str = "1:1"
+
+
+class AiEditImageRequest(BaseModel):
+    base64_image: str
+    prompt: str
+
+
+class AiVideoRequest(BaseModel):
+    base64_image: str
+    prompt: str
+    aspect_ratio: str = "16:9"
 
 
 # ----------------------------
@@ -229,6 +278,44 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     return user
 
 
+def get_ai_user(current_user: dict = Depends(get_current_user)) -> dict:
+    email = str(current_user.get("email") or "").strip().lower()
+    if APP_ENV in ("development", "dev", "local") and not AI_ALLOWED_EMAILS:
+        return current_user
+    if not AI_ALLOWED_EMAILS:
+        raise HTTPException(status_code=503, detail="AI access control is not configured")
+    if email not in AI_ALLOWED_EMAILS:
+        raise HTTPException(status_code=403, detail="AI access is not allowed for this account")
+    return current_user
+
+
+def _gemini_client():
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="AI service is not configured")
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def _decode_data_url(data_url: str) -> tuple[bytes, str]:
+    match = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", data_url, flags=re.DOTALL)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid image data URL")
+    mime_type, payload = match.group(1), match.group(2)
+    try:
+        return base64.b64decode(payload, validate=True), mime_type
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image")
+
+
+def _part_to_data_url(part) -> Optional[str]:
+    inline = getattr(part, "inline_data", None)
+    if inline is None or getattr(inline, "data", None) is None:
+        return None
+    raw = inline.data
+    encoded = raw if isinstance(raw, str) else base64.b64encode(bytes(raw)).decode("ascii")
+    mime = getattr(inline, "mime_type", None) or "image/png"
+    return f"data:{mime};base64,{encoded}"
+
+
 def get_or_create_social_user(email: str, full_name: str) -> dict:
     conn = get_db_connection()
     cur = conn.cursor(dictionary=True)
@@ -314,10 +401,9 @@ async def register(user: UserCreate):
     cur.close()
     conn.close()
 
-    # In production: send email via SMTP/n8n. Here we only print link (safe for logs).
+    # In production, send the verification token via a mailer (SMTP/n8n).
     if REQUIRE_EMAIL_VERIFICATION and verification_token:
-        verify_link = f"{API_BASE_URL}/verify-email?token={verification_token}"
-        print(f"[VERIFY] {user.email} -> {verify_link}")
+        print(f"[VERIFY] verification requested for {user.email}")
 
     msg = "Registration successful."
     if REQUIRE_EMAIL_VERIFICATION:
@@ -374,8 +460,8 @@ async def forgot_password(request: PasswordResetRequest):
         )
         conn.commit()
 
-        # In production: send email. For now print token.
-        print(f"[RESET] {request.email} -> token={token} (15min)")
+        # In production, send the reset token via a mailer (SMTP/n8n). Never log the token.
+        print(f"[RESET] password reset requested for {request.email}")
 
     cur.close()
     conn.close()
@@ -409,6 +495,136 @@ async def reset_password(data: PasswordResetConfirm):
     cur.close()
     conn.close()
     return {"message": "Password reset successfully"}
+
+
+# ----------------------------
+# Server-side AI proxy
+# ----------------------------
+@app.post("/ai/text")
+def ai_text(data: AiTextRequest, current_user: dict = Depends(get_ai_user)):
+    client = _gemini_client()
+    config_kwargs = {}
+
+    if data.system_instruction:
+        config_kwargs["system_instruction"] = data.system_instruction
+    if data.use_thinking:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=32768)
+    if data.use_search:
+        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+
+    model = GEMINI_THINKING_MODEL if data.use_thinking else GEMINI_TEXT_MODEL
+    response = client.models.generate_content(
+        model=model,
+        contents=data.prompt,
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
+
+    grounding_urls = []
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        metadata = getattr(candidates[0], "grounding_metadata", None)
+        chunks = getattr(metadata, "grounding_chunks", None) or []
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            uri = getattr(web, "uri", None) if web else None
+            title = getattr(web, "title", None) if web else None
+            if uri and not any(item["uri"] == uri for item in grounding_urls):
+                grounding_urls.append({"uri": uri, "title": title or uri})
+
+    return {"text": getattr(response, "text", "") or "", "groundingUrls": grounding_urls}
+
+
+@app.post("/ai/image")
+def ai_image(data: AiImageRequest, current_user: dict = Depends(get_ai_user)):
+    if data.aspect_ratio not in ("1:1", "3:4", "4:3", "9:16", "16:9"):
+        raise HTTPException(status_code=400, detail="Unsupported aspect ratio")
+
+    client = _gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_IMAGE_MODEL,
+        contents=data.prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            image_config=types.ImageConfig(aspect_ratio=data.aspect_ratio, image_size="1K"),
+        ),
+    )
+
+    for part in getattr(response, "parts", None) or []:
+        data_url = _part_to_data_url(part)
+        if data_url:
+            return {"data_url": data_url}
+    raise HTTPException(status_code=502, detail="AI image generation returned no image")
+
+
+@app.post("/ai/edit-image")
+def ai_edit_image(data: AiEditImageRequest, current_user: dict = Depends(get_ai_user)):
+    image_bytes, mime_type = _decode_data_url(data.base64_image)
+    client = _gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_IMAGE_EDIT_MODEL,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            data.prompt,
+        ],
+        config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+    )
+
+    for part in getattr(response, "parts", None) or []:
+        data_url = _part_to_data_url(part)
+        if data_url:
+            return {"data_url": data_url}
+    raise HTTPException(status_code=502, detail="AI image editing returned no image")
+
+
+@app.post("/ai/video")
+def ai_video(data: AiVideoRequest, current_user: dict = Depends(get_ai_user)):
+    if data.aspect_ratio not in ("16:9", "9:16"):
+        raise HTTPException(status_code=400, detail="Unsupported video aspect ratio")
+
+    image_bytes, mime_type = _decode_data_url(data.base64_image)
+    client = _gemini_client()
+    source = types.GenerateVideosSource(
+        prompt=data.prompt or "Animate this image",
+        image=types.Image(image_bytes=image_bytes, mime_type=mime_type),
+    )
+    operation = client.models.generate_videos(
+        model=GEMINI_VIDEO_MODEL,
+        source=source,
+        config=types.GenerateVideosConfig(
+            number_of_videos=1,
+            resolution="720p",
+            aspect_ratio=data.aspect_ratio,
+        ),
+    )
+
+    deadline = time.time() + 300
+    while not operation.done:
+        if time.time() >= deadline:
+            raise HTTPException(status_code=504, detail="Video generation timed out")
+        time.sleep(10)
+        operation = client.operations.get(operation)
+
+    generated = getattr(getattr(operation, "response", None), "generated_videos", None) or []
+    if not generated or not getattr(generated[0], "video", None):
+        raise HTTPException(status_code=502, detail="AI video generation returned no video")
+
+    fd, output_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    try:
+        client.files.download(file=generated[0].video, destination=output_path)
+    except Exception:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        raise
+
+    return FileResponse(
+        output_path,
+        media_type="video/mp4",
+        filename="generated.mp4",
+        background=BackgroundTask(lambda: os.path.exists(output_path) and os.unlink(output_path)),
+    )
 
 
 # ----------------------------

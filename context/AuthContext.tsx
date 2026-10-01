@@ -11,8 +11,8 @@ interface AuthContextType extends AuthState {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-// Defaults to localhost fastapi port, change in production
-const API_URL = 'http://localhost:8000';
+// Use VITE_API_URL locally; production defaults to the same-origin reverse proxy.
+const API_URL = (import.meta.env.VITE_API_URL || '/suite/api').replace(/\/$/, '');
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [state, setState] = useState<AuthState>({
