@@ -76,6 +76,8 @@ GEMINI_THINKING_MODEL = _env("GEMINI_THINKING_MODEL", default="gemini-3-pro-prev
 GEMINI_IMAGE_MODEL = _env("GEMINI_IMAGE_MODEL", default="gemini-3-pro-image-preview")
 GEMINI_IMAGE_EDIT_MODEL = _env("GEMINI_IMAGE_EDIT_MODEL", default="gemini-2.5-flash-image")
 GEMINI_VIDEO_MODEL = _env("GEMINI_VIDEO_MODEL", default="veo-3.1-fast-generate-preview")
+AI_ALLOWED_EMAILS_RAW = _env("AI_ALLOWED_EMAILS", default="")
+AI_ALLOWED_EMAILS = {email.strip().lower() for email in AI_ALLOWED_EMAILS_RAW.split(",") if email.strip()}
 
 # OAuth (optional)
 GOOGLE_CLIENT_ID = _env("GOOGLE_CLIENT_ID", default="")
@@ -276,6 +278,17 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     return user
 
 
+def get_ai_user(current_user: dict = Depends(get_current_user)) -> dict:
+    email = str(current_user.get("email") or "").strip().lower()
+    if APP_ENV in ("development", "dev", "local") and not AI_ALLOWED_EMAILS:
+        return current_user
+    if not AI_ALLOWED_EMAILS:
+        raise HTTPException(status_code=503, detail="AI access control is not configured")
+    if email not in AI_ALLOWED_EMAILS:
+        raise HTTPException(status_code=403, detail="AI access is not allowed for this account")
+    return current_user
+
+
 def _gemini_client():
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="AI service is not configured")
@@ -422,7 +435,7 @@ async def verify_email(token: str):
 
 
 @app.get("/users/me", response_model=UserOut)
-async def read_users_me(current_user: dict = Depends(get_current_user)):
+async def read_users_me(current_user: dict = Depends(get_ai_user)):
     return {
         "id": current_user["id"],
         "email": current_user["email"],
@@ -488,7 +501,7 @@ async def reset_password(data: PasswordResetConfirm):
 # Server-side AI proxy
 # ----------------------------
 @app.post("/ai/text")
-def ai_text(data: AiTextRequest, current_user: dict = Depends(get_current_user)):
+def ai_text(data: AiTextRequest, current_user: dict = Depends(get_ai_user)):
     client = _gemini_client()
     config_kwargs = {}
 
@@ -522,7 +535,7 @@ def ai_text(data: AiTextRequest, current_user: dict = Depends(get_current_user))
 
 
 @app.post("/ai/image")
-def ai_image(data: AiImageRequest, current_user: dict = Depends(get_current_user)):
+def ai_image(data: AiImageRequest, current_user: dict = Depends(get_ai_user)):
     if data.aspect_ratio not in ("1:1", "3:4", "4:3", "9:16", "16:9"):
         raise HTTPException(status_code=400, detail="Unsupported aspect ratio")
 
@@ -544,7 +557,7 @@ def ai_image(data: AiImageRequest, current_user: dict = Depends(get_current_user
 
 
 @app.post("/ai/edit-image")
-def ai_edit_image(data: AiEditImageRequest, current_user: dict = Depends(get_current_user)):
+def ai_edit_image(data: AiEditImageRequest, current_user: dict = Depends(get_ai_user)):
     image_bytes, mime_type = _decode_data_url(data.base64_image)
     client = _gemini_client()
     response = client.models.generate_content(
@@ -564,7 +577,7 @@ def ai_edit_image(data: AiEditImageRequest, current_user: dict = Depends(get_cur
 
 
 @app.post("/ai/video")
-def ai_video(data: AiVideoRequest, current_user: dict = Depends(get_current_user)):
+def ai_video(data: AiVideoRequest, current_user: dict = Depends(get_ai_user)):
     if data.aspect_ratio not in ("16:9", "9:16"):
         raise HTTPException(status_code=400, detail="Unsupported video aspect ratio")
 
